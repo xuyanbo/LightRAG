@@ -1345,6 +1345,9 @@ class LightRAG:
                                 )
                             content = content_data["content"]
 
+                            # Record processing start time
+                            processing_start_time = int(time.time())
+
                             # Generate chunks from document
                             chunks: dict[str, Any] = {
                                 compute_mdhash_id(dp["content"], prefix="chunk-"): {
@@ -1365,9 +1368,6 @@ class LightRAG:
 
                             if not chunks:
                                 logger.warning("No document chunks to process")
-
-                            # Record processing start time
-                            processing_start_time = int(time.time())
 
                             # Process document in two stages
                             # Stage 1: Process text chunks and docs (parallel execution)
