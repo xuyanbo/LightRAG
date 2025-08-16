@@ -66,7 +66,6 @@ def chunking_by_token_size(
     overlap_token_size: int = 128,
     max_token_size: int = 1024,
 ) -> list[dict[str, Any]]:
-    tokens = tokenizer.encode(content)
     results: list[dict[str, Any]] = []
     if split_by_character:
         raw_chunks = content.split(split_by_character)
@@ -99,17 +98,43 @@ def chunking_by_token_size(
                 }
             )
     else:
-        for index, start in enumerate(
-            range(0, len(tokens), max_token_size - overlap_token_size)
-        ):
-            chunk_content = tokenizer.decode(tokens[start : start + max_token_size])
-            results.append(
-                {
-                    "tokens": min(max_token_size, len(tokens) - start),
-                    "content": chunk_content.strip(),
-                    "chunk_order_index": index,
-                }
-            )
+        # Try to keep semantically related content together by splitting on
+        # common section markers (headings, table names, numbered lists, etc.).
+        section_pattern = re.compile(
+            r"\n(?=(?:\d+(?:\.\d+)*\s+|#{1,6}\s+|表\d+\s+|[一二三四五六七八九十]+、))"
+        )
+        sections = re.split(section_pattern, content)
+        section_index = 0
+        for section in sections:
+            if not section.strip():
+                continue
+            section_tokens = tokenizer.encode(section)
+            if len(section_tokens) > max_token_size:
+                for start in range(
+                    0, len(section_tokens), max_token_size - overlap_token_size
+                ):
+                    chunk_content = tokenizer.decode(
+                        section_tokens[start : start + max_token_size]
+                    )
+                    results.append(
+                        {
+                            "tokens": min(
+                                max_token_size, len(section_tokens) - start
+                            ),
+                            "content": chunk_content.strip(),
+                            "chunk_order_index": section_index,
+                        }
+                    )
+                    section_index += 1
+            else:
+                results.append(
+                    {
+                        "tokens": len(section_tokens),
+                        "content": section.strip(),
+                        "chunk_order_index": section_index,
+                    }
+                )
+                section_index += 1
     return results
 
 
@@ -199,7 +224,16 @@ async def _handle_single_entity_extraction(
     entity_description = clean_str(record_attributes[3])
     entity_description = normalize_extracted_info(entity_description)
 
-    if not entity_description.strip():
+    # Parse optional structured attributes
+    attributes = {}
+    if len(record_attributes) >= 5:
+        attrs_str = clean_str(record_attributes[4])
+        try:
+            attributes = json.loads(attrs_str)
+        except Exception:
+            attributes = {}
+
+    if not entity_description.strip() and not attributes:
         logger.warning(
             f"Entity extraction error: empty description for entity '{entity_name}' of type '{entity_type}'"
         )
@@ -209,6 +243,7 @@ async def _handle_single_entity_extraction(
         entity_name=entity_name,
         entity_type=entity_type,
         description=entity_description,
+        attributes=attributes,
         source_id=chunk_key,
         file_path=file_path,
     )
@@ -671,15 +706,23 @@ async def _rebuild_single_entity(
     if not current_entity:
         return
 
+    current_attributes = {}
+    if current_entity.get("attributes"):
+        try:
+            current_attributes = json.loads(current_entity["attributes"])
+        except Exception:
+            current_attributes = {}
+
     # Helper function to update entity in both graph and vector storage
     async def _update_entity_storage(
-        final_description: str, entity_type: str, file_paths: set[str]
+        final_description: str, entity_type: str, file_paths: set[str], attributes: dict
     ):
         # Update entity in graph storage
         updated_entity_data = {
             **current_entity,
             "description": final_description,
             "entity_type": entity_type,
+            "attributes": json.dumps(attributes, ensure_ascii=False),
             "source_id": GRAPH_FIELD_SEP.join(chunk_ids),
             "file_path": GRAPH_FIELD_SEP.join(file_paths)
             if file_paths
@@ -700,6 +743,8 @@ async def _rebuild_single_entity(
 
         # Insert new vector record
         entity_content = f"{entity_name}\n{final_description}"
+        if attributes:
+            entity_content += "\n" + json.dumps(attributes, ensure_ascii=False)
         await entities_vdb.upsert(
             {
                 entity_vdb_id: {
@@ -709,6 +754,7 @@ async def _rebuild_single_entity(
                     "description": final_description,
                     "entity_type": entity_type,
                     "file_path": updated_entity_data["file_path"],
+                    "attributes": json.dumps(attributes, ensure_ascii=False),
                 }
             }
         )
@@ -768,13 +814,16 @@ async def _rebuild_single_entity(
             final_description = current_entity.get("description", "")
 
         entity_type = current_entity.get("entity_type", "UNKNOWN")
-        await _update_entity_storage(final_description, entity_type, file_paths)
+        await _update_entity_storage(
+            final_description, entity_type, file_paths, current_attributes
+        )
         return
 
     # Process cached entity data
     descriptions = []
     entity_types = []
     file_paths = set()
+    attributes_list = []
 
     for entity_data in all_entity_data:
         if entity_data.get("description"):
@@ -783,6 +832,8 @@ async def _rebuild_single_entity(
             entity_types.append(entity_data["entity_type"])
         if entity_data.get("file_path"):
             file_paths.add(entity_data["file_path"])
+        if entity_data.get("attributes"):
+            attributes_list.append(entity_data["attributes"])
 
     # Combine all descriptions
     combined_description = (
@@ -798,9 +849,15 @@ async def _rebuild_single_entity(
         else current_entity.get("entity_type", "UNKNOWN")
     )
 
+    final_attributes = {}
+    for attrs in attributes_list:
+        final_attributes.update(attrs)
+    if not final_attributes:
+        final_attributes = current_attributes
+
     # Generate final description and update storage
     final_description = await _generate_final_description(combined_description)
-    await _update_entity_storage(final_description, entity_type, file_paths)
+    await _update_entity_storage(final_description, entity_type, file_paths, final_attributes)
 
 
 async def _rebuild_single_relationship(
@@ -944,6 +1001,7 @@ async def _merge_nodes_then_upsert(
     already_source_ids = []
     already_description = []
     already_file_paths = []
+    already_attributes = []
 
     already_node = await knowledge_graph_inst.get_node(entity_name)
     if already_node:
@@ -955,6 +1013,11 @@ async def _merge_nodes_then_upsert(
             split_string_by_multi_markers(already_node["file_path"], [GRAPH_FIELD_SEP])
         )
         already_description.append(already_node["description"])
+        if already_node.get("attributes"):
+            try:
+                already_attributes.append(json.loads(already_node["attributes"]))
+            except Exception:
+                pass
 
     entity_type = sorted(
         Counter(
@@ -970,6 +1033,13 @@ async def _merge_nodes_then_upsert(
         set([dp["source_id"] for dp in nodes_data] + already_source_ids)
     )
     file_path = build_file_path(already_file_paths, nodes_data, entity_name)
+
+    attributes: dict[str, Any] = {}
+    for dp in nodes_data:
+        if dp.get("attributes"):
+            attributes.update(dp["attributes"])
+    for attrs in already_attributes:
+        attributes.update(attrs)
 
     force_llm_summary_on_merge = global_config["force_llm_summary_on_merge"]
 
@@ -1004,6 +1074,7 @@ async def _merge_nodes_then_upsert(
         description=description,
         source_id=source_id,
         file_path=file_path,
+        attributes=json.dumps(attributes, ensure_ascii=False),
         created_at=int(time.time()),
     )
     await knowledge_graph_inst.upsert_node(
@@ -1011,6 +1082,7 @@ async def _merge_nodes_then_upsert(
         node_data=node_data,
     )
     node_data["entity_name"] = entity_name
+    node_data["attributes"] = json.dumps(attributes, ensure_ascii=False)
     return node_data
 
 
@@ -1277,9 +1349,10 @@ async def merge_nodes_and_edges(
                         compute_mdhash_id(entity_data["entity_name"], prefix="ent-"): {
                             "entity_name": entity_data["entity_name"],
                             "entity_type": entity_data["entity_type"],
-                            "content": f"{entity_data['entity_name']}\n{entity_data['description']}",
+                            "content": f"{entity_data['entity_name']}\n{entity_data['description']}\n{entity_data.get('attributes','')}",
                             "source_id": entity_data["source_id"],
                             "file_path": entity_data.get("file_path", "unknown_source"),
+                            "attributes": entity_data.get("attributes", ""),
                         }
                     }
                     await entity_vdb.upsert(data_for_vdb)
@@ -1489,6 +1562,9 @@ async def extract_entities(
     entity_types = global_config["addon_params"].get(
         "entity_types", PROMPTS["DEFAULT_ENTITY_TYPES"]
     )
+    relation_types = global_config["addon_params"].get(
+        "relation_types", PROMPTS.get("DEFAULT_RELATION_TYPES", [])
+    )
     example_number = global_config["addon_params"].get("example_number", None)
     if example_number and example_number < len(PROMPTS["entity_extraction_examples"]):
         examples = "\n".join(
@@ -1503,6 +1579,7 @@ async def extract_entities(
         completion_delimiter=PROMPTS["DEFAULT_COMPLETION_DELIMITER"],
         entity_types=", ".join(entity_types),
         language=language,
+        relation_types=", ".join(relation_types),
     )
     # add example's format
     examples = examples.format(**example_context_base)
@@ -1513,6 +1590,7 @@ async def extract_entities(
         record_delimiter=PROMPTS["DEFAULT_RECORD_DELIMITER"],
         completion_delimiter=PROMPTS["DEFAULT_COMPLETION_DELIMITER"],
         entity_types=",".join(entity_types),
+        relation_types=",".join(relation_types),
         examples=examples,
         language=language,
     )
