@@ -66,6 +66,19 @@ def chunking_by_token_size(
     overlap_token_size: int = 128,
     max_token_size: int = 1024,
 ) -> list[dict[str, Any]]:
+    # Ensure valid token sizes to avoid zero or negative step in range()
+    overlap_token_size = max(0, overlap_token_size)
+    max_token_size = max(1, max_token_size)
+    step = max(1, max_token_size - overlap_token_size)
+
+    if overlap_token_size >= max_token_size:
+        logger.warning(
+            "overlap_token_size (%s) is greater than or equal to max_token_size (%s);"
+            " adjusting to ensure progress",
+            overlap_token_size,
+            max_token_size,
+        )
+
     results: list[dict[str, Any]] = []
     if split_by_character:
         raw_chunks = content.split(split_by_character)
@@ -78,9 +91,7 @@ def chunking_by_token_size(
             for chunk in raw_chunks:
                 _tokens = tokenizer.encode(chunk)
                 if len(_tokens) > max_token_size:
-                    for start in range(
-                        0, len(_tokens), max_token_size - overlap_token_size
-                    ):
+                    for start in range(0, len(_tokens), step):
                         chunk_content = tokenizer.decode(
                             _tokens[start : start + max_token_size]
                         )
@@ -110,9 +121,7 @@ def chunking_by_token_size(
                 continue
             section_tokens = tokenizer.encode(section)
             if len(section_tokens) > max_token_size:
-                for start in range(
-                    0, len(section_tokens), max_token_size - overlap_token_size
-                ):
+                for start in range(0, len(section_tokens), step):
                     chunk_content = tokenizer.decode(
                         section_tokens[start : start + max_token_size]
                     )
